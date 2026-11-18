@@ -2,7 +2,7 @@
 
 Structure-based protein–protein interaction screening with [Boltz-2](https://github.com/jwohlwend/boltz) and [AlphaFold 3](https://github.com/google-deepmind/alphafold3).
 
-Analogous to [AlphaPulldown](https://github.com/KosinskiLab/AlphaPulldown) (Yu et al., *Bioinformatics* 2023) but built on a Nextflow pipeline that runs two independently trained next-generation structure predictors under a single ranking schema.
+Loosely analogous to [AlphaPulldown](https://github.com/KosinskiLab/AlphaPulldown) (Yu et al., *Bioinformatics* 2023) but built on a Nextflow pipeline that runs two independently trained next-generation structure predictors under a single ranking schema.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="extras/pipeline_subway_dark.png">
@@ -11,18 +11,38 @@ Analogous to [AlphaPulldown](https://github.com/KosinskiLab/AlphaPulldown) (Yu e
 
 ## Features
 
-- **Bait × candidate screening** — one-vs-many or many-vs-many, from two FASTA files
-- **Pair-list mode** — predict only a named set of pairs (e.g. proteomics hits) with `--pairs_tsv`
+- **Explicit pair lists** — every run takes `--sequences_fasta` (protein pool) and `--pairs_tsv` (the pairs to predict), allowing for flexible screens that can be shaped like baits x candidates, all-vs-all or something else.
 - **Dual backend** — Boltz-2 and AlphaFold 3, selectable with `--predictor boltz2 | alphafold3`
 - **Post-translational modifications** — specified via a single ID-keyed TSV/CSV using CCD codes (e.g. SEP, TPO, NAG)
 - **Per-predictor MSA strategies** — Boltz-2 uses ColabFold-lineage search with taxonomy tagging; AlphaFold 3 uses its own native 4-database search (UniRef90, MGnify, Small BFD for unpaired MSA; UniProt for paired MSA)
 - **MSA caching** — cached alignments are reused across pairs and across runs; proteins with existing cache entries skip MSA search entirely
 - **MSA server mode** — Boltz-2 can fetch MSAs from the public ColabFold API (`--use_msa_server true`, the default), avoiding local database requirements for small screens
-- **Unified ranking** — ipTM, pTM, pDockQ, pLDDT, and confidence scores reported in a single TSV regardless of backend
+- **MSA-only mode** — `--msa_only` runs the MSA stages without submitting any GPU work, for validating infrastructure or pre-warming the cache
+- **Unified ranking** — ipTM, pTM, pDockQ, and pLDDT reported in a single TSV; shared metrics use bare column names, while predictor-specific scores carry a `boltz2_` or `af3_` prefix
+- **Chain-order contract** — column 1 of the pair list is the bait, which becomes chain A in every output structure
+
+## Input model
+
+Every run takes two inputs:
+
+| Flag | Description |
+|------|-------------|
+| `--sequences_fasta` | A multi-sequence FASTA holding every protein in the study |
+| `--pairs_tsv` | The pairs to predict: first two columns are protein IDs (header auto-detected; further columns are ignored) |
+
+The pair list is the screen definition. If you want a cross-product or all-vs-all rather than an explicit list, generate it first by hand or with the `bin/make_pairs.py` helper:
+
+```bash
+# Classic pulldown: one bait against a candidate panel
+bin/make_pairs.py --baits baits.fasta --candidates candidates.fasta > pairs/pulldown.tsv
+
+# All-vs-all
+bin/make_pairs.py --all-vs-all pool.fasta > pairs/all_vs_all.tsv
+```
 
 ## Pipeline stages
 
-1. **GENERATE_PAIRS** — enumerate bait × candidate pairs (cross-product mode) or read a named pair list (pair-list mode). Pairs are collapsed on `tuple(sorted((a,b)))` to avoid predicting both A\_with\_B and B\_with\_A.
+1. **GENERATE_PAIRS** — resolve each ID in `--pairs_tsv` against `--sequences_fasta`, inline both sequences, collapse unordered duplicates, and emit the materialized `pairs.tsv`. This file also defines the MSA universe.
 2. **MSA search** — compute MSAs per unique protein, with predictor-specific strategies:
    - *Boltz-2 local mode* (`use_msa_server=false`): MSA_SEARCH_DB_BOLTZ2 (UniRef30) → optionally MSA_SEARCH_ENV_BOLTZ2 (env/metagenomic) → MERGE_TAXONOMY_BOLTZ2 (taxonomy-ID tagging via redis + CSV output)
    - *Boltz-2 server mode* (`use_msa_server=true`, default): skipped entirely; Boltz-2 fetches MSAs from the ColabFold API at prediction time
@@ -32,18 +52,20 @@ Analogous to [AlphaPulldown](https://github.com/KosinskiLab/AlphaPulldown) (Yu e
 5. **PARSE_METRICS / PARSE_METRICS_AF3** — extract confidence scores and compute pDockQ per pair
 6. **RANK_PREDICTIONS** — aggregate all pairs into a single ranked TSV
 
+Stages 3–6 are skipped under `--msa_only`.
+
 ## Quick start
 
 ```bash
 # Boltz-2 with MSA server (default, simplest — no local databases needed)
 nextflow run main.nf -profile slurm \
-  --baits_fasta inputs/sequences/baits.fasta \
-  --candidates_fasta inputs/sequences/candidates.fasta
+  --sequences_fasta inputs/sequences/proteins.fasta \
+  --pairs_tsv inputs/pairs/actin_pulldown.tsv
 
 # Boltz-2 with local MSA (no public API dependency; for large screens)
 nextflow run main.nf -profile slurm \
-  --baits_fasta inputs/sequences/baits.fasta \
-  --candidates_fasta inputs/sequences/candidates.fasta \
+  --sequences_fasta inputs/sequences/proteins.fasta \
+  --pairs_tsv inputs/pairs/all_vs_all.tsv \
   --use_msa_server false \
   --boltz2_uniref30_db /path/to/uniref30_2302_db \
   --taxonomy_rdb /path/to/taxonomy.rdb
@@ -52,18 +74,27 @@ nextflow run main.nf -profile slurm \
 nextflow run main.nf -profile slurm \
   --predictor alphafold3 \
   --use_msa_server false \
-  --baits_fasta inputs/sequences/baits.fasta \
-  --candidates_fasta inputs/sequences/candidates.fasta
+  --sequences_fasta inputs/sequences/proteins.fasta \
+  --pairs_tsv inputs/pairs/actin_pulldown.tsv
 
-# Pair-list mode: predict only named pairs (e.g. from proteomics)
+# Proteomics edge list: predict only reported pairs
 nextflow run main.nf -profile slurm \
+  --sequences_fasta all_proteins.fasta \
+  --pairs_tsv ms_hits.tsv
+
+# MSA-only mode (validate infrastructure, pre-warm cache, no GPU work)
+nextflow run main.nf -profile slurm \
+  --sequences_fasta all_proteins.fasta \
   --pairs_tsv ms_hits.tsv \
-  --sequences_fasta all_proteins.fasta
+  --use_msa_server false \
+  --msa_only true
 
 # Reuse pre-computed alignments (skips MSA search for cached proteins)
 nextflow run main.nf -profile slurm \
   --predictor alphafold3 \
   --use_msa_server false \
+  --sequences_fasta all_proteins.fasta \
+  --pairs_tsv ms_hits.tsv \
   --alignments_dir_af3 results/alignments_af3
 ```
 
@@ -78,19 +109,9 @@ The `-profile slurm` flag is required for GPU-accelerated prediction on HPC clus
 | `sge` | Sun Grid Engine |
 | `test` | Quick test with the bundled actin toy set (reduced sampling) |
 
-## Input modes
-
-### Cross-product mode (default)
-
-Provide `--baits_fasta` and `--candidates_fasta`. Every bait is screened against every candidate. Use `--self_pairs` to include homodimer predictions when proteins appear in both files.
-
-### Pair-list mode
-
-Provide `--pairs_tsv` and `--sequences_fasta`. Only the pairs named in the TSV are predicted, using sequences drawn from the FASTA. The first two columns of the TSV are protein IDs (a header row is auto-detected). This mode is intended for adding structure-based ranking to an existing experimental edge list (e.g. PPIs from AP-MS or proximity labeling), rather than enumerating a full cross-product.
-
 ## Post-translational modifications
 
-Place a file named `ptms.tsv` (or `ptms.csv`) in the same directory as your sequences FASTA, or specify it explicitly with `--ptms`. One table covers the entire run — modifications are resolved by protein ID, not by bait/candidate role:
+Place a file named `ptms.tsv` (or `ptms.csv`) in the same directory as your `--sequences_fasta`, or specify it explicitly with `--ptms`. One table covers the entire run — modifications are resolved by protein ID, not by bait/candidate role:
 
 ```tsv
 protein_id	position	ccd
@@ -106,7 +127,7 @@ The two predictors were trained on different MSA lineages, so OmegaPulldown main
 
 ### Boltz-2
 
-- **Server mode** (`use_msa_server=true`, default): Boltz-2 fetches MSAs from the ColabFold API at prediction time. Simplest setup — no local databases required. Recommended for small-to-moderate screens.
+- **Server mode** (`use_msa_server=true`, default): Boltz-2 fetches MSAs from the ColabFold API at prediction time. Simplest setup: no local databases required. Recommended for small-to-moderate screens.
 - **Local mode** (`use_msa_server=false`): pre-computes MSAs via mmseqs2 against UniRef30 (+ optionally an environmental database with `--use_env true`), performs taxonomy-ID tagging via a local redis instance loaded with Boltz-2's `taxonomy.rdb`, and writes per-protein CSV files. Recommended for large all-vs-all screens to avoid API rate limits and redundant remote queries.
 - **Cache**: per-protein CSV files at `alignments_dir_boltz2/csv/<protein_id>.csv`.
 
@@ -122,9 +143,20 @@ The two predictors were trained on different MSA lineages, so OmegaPulldown main
 - **Boltz-2**: 5 diffusion samples per prediction (configurable via `diffusion_samples`). Boltz-2 uses conditional flow matching, which preserves structural diversity across samples. Physics-based steering potentials are enabled by default (`use_potentials=true`).
 - **AlphaFold 3**: 5 seeds × 1 diffusion sample (configurable via `af3_seeds` and `af3_samples`). Within-seed samples show narrow variance in practice, so seed-to-seed variation (independent MSA subsampling and trunk computation) better captures prediction uncertainty.
 
-## Ranking
+## Ranking and metrics
 
-All predictions are ranked by `protein_iptm` (mean across samples) by default. This can be changed via the `rank_by` parameter. Available metrics: `protein_iptm`, `iptm`, `pdockq`, `confidence_score`, `complex_plddt`.
+All predictions are ranked by `protein_iptm` (mean across samples) by default. This can be changed via `--rank_by`. The `--rank_by` value is validated at startup.
+
+The two rankings tables share a **comparable** core schema and nothing else. Column naming reflects this:
+
+| Column | Comparable? | Notes |
+|--------|-------------|-------|
+| `ptm`, `iptm`, `protein_iptm` | Yes | Same definition in both predictors |
+| `pdockq`, `n_interface_contacts`, `avg_interface_plddt` | Yes | Computed from CIF by `compute_pdockq.py` |
+| `boltz2_confidence_score` | No | 0.8 × complex_plddt + 0.2 × iptm |
+| `af3_ranking_score` | No | 0.8 × iptm + 0.2 × ptm + 0.5 × fraction_disordered − 100 × has_clash |
+| `boltz2_complex_plddt`, `boltz2_complex_iplddt` | No | Token (per-residue) mean, 0–1 scale |
+| `af3_complex_plddt`, `af3_complex_iplddt` | No | Atom-weighted mean from CIF B-factors, 0–100 scale |
 
 The output TSV (`results/rankings_<predictor>.tsv`) reports mean and standard deviation for every metric across the samples for each pair.
 
@@ -145,7 +177,8 @@ OmegaPulldown/
 │   ├── rank.nf                    # PARSE_METRICS, RANK_PREDICTIONS
 │   └── rank_af3.nf                # PARSE_METRICS_AF3
 ├── bin/
-│   ├── generate_pairs.py          # Pair enumeration (cross-product or pair-list)
+│   ├── generate_pairs.py          # Pair-list resolver (IDs → sequences)
+│   ├── make_pairs.py              # Pair-list generator (cross-product, all-vs-all)
 │   ├── make_boltz_yaml.py         # Boltz-2 YAML input builder with PTM support
 │   ├── make_af3_json.py           # AF3 JSON builder with A3M cleaning + PTMs
 │   ├── a3m_to_boltz_csv.py        # A3M → Boltz-2 CSV with taxonomy tagging
@@ -153,7 +186,11 @@ OmegaPulldown/
 │   ├── merge_af3_native_msa.py    # Merge multi-DB A3Ms with deduplication
 │   └── compute_pdockq.py          # pDockQ from predicted CIF structures
 ├── inputs/
-│   └── sequences/                 # Example FASTA files (actin toy set)
+│   ├── sequences/
+│   │   └── proteins.fasta         # Example protein pool (actin toy set)
+│   └── pairs/
+│       ├── actin_pulldown.tsv     # Example: actin vs. four candidates
+│       └── all_vs_all.tsv         # Example: all pairwise combinations
 ├── extras/
 │   └── pipeline_subway.png        # Pipeline schematic
 └── results/                       # Output directory (not tracked in git)
@@ -161,7 +198,7 @@ OmegaPulldown/
 
 ## Requirements
 
-- [Nextflow](https://www.nextflow.io/) ≥ 23.04.0
+- [Nextflow](https://www.nextflow.io/) ≥ 22.10
 - [mmseqs2](https://github.com/soedinglab/MMseqs2) (for local MSA computation; not needed if using `use_msa_server=true` with Boltz-2)
 - [Boltz-2](https://github.com/jwohlwend/boltz) (conda environment)
 - [AlphaFold 3](https://github.com/google-deepmind/alphafold3) (Singularity container). Model weights require a [license agreement with Google DeepMind](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md).

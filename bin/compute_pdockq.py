@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pDockQ from a predicted complex structure.
+pDockQ from a predicted complex.
 
 pDockQ follows Bryant et al. (2022, Nat Commun 13:6028):
     x      = avg_interface_pLDDT * log10(n_interface_contacts)
@@ -134,6 +134,11 @@ def compute_pdockq(cif_path):
 
     # Separate chains
     chains = sorted(set(k[0] for k in cb.keys()))
+    if len(chains) > 2:
+        print(f"WARNING: {cif_path} has {len(chains)} chains "
+              f"({', '.join(chains)}); pDockQ is being computed for "
+              f"{chains[0]}-{chains[1]} only and the rest are ignored",
+              file=sys.stderr)
     if len(chains) < 2:
         return None, 0, 0.0
 
@@ -165,12 +170,10 @@ def compute_pdockq(cif_path):
     n_contacts = int(np.sum(contact_mask))
 
     if n_contacts == 0:
-        # None, not 0.0 -- "no interface" is not the same measurement as "an
+        # None, not 0.0. "no interface" is not the same measurement as "an
         # interface that scores zero", and the callers rely on the
         # distinction: PARSE_METRICS skips None rather than averaging it into
-        # pdockq_mean. This matches the behaviour the embedded copies have
-        # always had; the standalone script this was promoted from returned
-        # 0.0 here, and that difference was reconciled in favour of None.
+        # pdockq_mean.
         return None, 0, 0.0
 
     # Interface residue indices
@@ -186,7 +189,6 @@ def compute_pdockq(cif_path):
 
     return pdockq, n_contacts, avg_interface_plddt
 
-
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__.strip().splitlines()[0])
@@ -196,7 +198,6 @@ def main():
         print("%s\t%s\t%d\t%.4f" % (
             path, "" if pdockq is None else "%.6f" % pdockq,
             n_contacts, avg_if_plddt))
-
 
 if __name__ == "__main__":
     main()

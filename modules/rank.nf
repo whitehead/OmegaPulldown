@@ -42,12 +42,34 @@ process PARSE_METRICS {
     # =====================================================================
     # Collect per-sample metrics
     # =====================================================================
-    conf_keys = ['confidence_score','ptm','iptm','protein_iptm',
-                 'complex_plddt','complex_iplddt']
+    # These are read straight out of Boltz-2's own confidence JSON:
+    # no derivation, no substitution. Boltz reports complex_plddt and
+    # complex_iplddt on a 0-1 scale as a TOKEN (per-residue) mean, both
+    # confirmed against the CIF to be exactly the per-residue mean of
+    # the B-factor column, not the per-atom mean.
+    #
+    # Relative to AF3, ptm / iptm / protein_iptm and the three
+    # compute_pdockq are comparable, while complex_plddt, complex_iplddt and
+    # confidence_score are not: different scales, different weightings,
+    # different interface definitions, and in the case of confidence_score,
+    # two different composite formulas under one name:
+    #
+    #   Boltz confidence_score = 0.8*complex_plddt + 0.2*iptm   (verified 1e-8)
+    #   AF3   ranking_score    = 0.8*iptm + 0.2*ptm
+    #                            + 0.5*fraction_disordered - 100*has_clash
+    conf_map = [
+        ('confidence_score', 'boltz2_confidence_score'),
+        ('ptm',              'ptm'),
+        ('iptm',             'iptm'),
+        ('protein_iptm',     'protein_iptm'),
+        ('complex_plddt',    'boltz2_complex_plddt'),
+        ('complex_iplddt',   'boltz2_complex_iplddt'),
+    ]
+    conf_keys = [col for _, col in conf_map]
     struct_keys = ['pdockq','n_interface_contacts','avg_interface_plddt']
     all_keys = conf_keys + struct_keys
 
-    # Discover samples — Boltz-2 names them *_model_0.json .. *_model_N.json
+    # Discover samples: Boltz-2 names them *_model_0.json .. *_model_N.json
     conf_files = sorted(glob.glob("confidence_*.json"))
     cif_files  = sorted(glob.glob("*.cif"))
     n_samples  = max(len(conf_files), len(cif_files), 1)
@@ -60,10 +82,10 @@ process PARSE_METRICS {
         if i < len(conf_files):
             with open(conf_files[i]) as f:
                 data = json.load(f)
-            for key in conf_keys:
-                v = data.get(key)
+            for src, col in conf_map:
+                v = data.get(src)
                 if v is not None:
-                    sample_vals[key].append(float(v))
+                    sample_vals[col].append(float(v))
         # --- Structural metrics (pDockQ) ---
         if i < len(cif_files):
             pdockq, nc, aip = compute_pdockq(cif_files[i])
@@ -108,7 +130,7 @@ process PARSE_METRICS {
     // Minimal placeholder, not a duplicate of the embedded Python parser
     // above: just satisfies the declared output for wiring checks.
     """
-    printf "pair_id\\tn_samples\\tconfidence_score_mean\\tconfidence_score_std\\n" > ${pair_id}.metrics.tsv
+    printf "pair_id\\tn_samples\\tboltz2_confidence_score_mean\\tboltz2_confidence_score_std\\n" > ${pair_id}.metrics.tsv
     printf "${pair_id}\\t1\\t0.5\\tNA\\n" >> ${pair_id}.metrics.tsv
     """
 }
@@ -144,18 +166,22 @@ process RANK_PREDICTIONS {
                 rows.append(row.split("\\t"))
 
     # The rank_by param names the base metric (e.g. protein_iptm).
-    # Columns are now named {metric}_mean, {metric}_std, so append _mean.
     rank_by = "${params.rank_by}"
     cols = header.split("\\t")
     rank_col = rank_by + "_mean"
-    try:
-        idx = cols.index(rank_col)
-    except ValueError:
-        # Fallback: try the raw name, then default to column 2 (first _mean col)
-        try:
-            idx = cols.index(rank_by)
-        except ValueError:
-            idx = 2
+    if rank_col not in cols:
+        if rank_by in cols:
+            rank_col = rank_by
+        else:
+            avail = sorted(c[:-5] for c in cols if c.endswith("_mean"))
+            sys.exit(
+                f"--rank_by '{rank_by}' names no column in the metrics table "
+                f"(looked for '{rank_by}_mean' and '{rank_by}'). "
+                f"Available metrics: {', '.join(avail)}. "
+                f"Note that these columns are NOT all comparable between "
+                f"predictors -- see the column reference in modules/rank_af3.nf."
+            )
+    idx = cols.index(rank_col)
 
     def sortkey(r):
         try:

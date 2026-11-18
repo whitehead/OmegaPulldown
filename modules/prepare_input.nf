@@ -1,22 +1,34 @@
 /*
- * Pair enumeration (predictor-agnostic) and Boltz-2 YAML assembly.
+ * Pair construction (predictor-agnostic) and Boltz-2 YAML assembly.
  *
- * GENERATE_PAIRS builds the pair list that drives the whole pipeline, in
- * either of two modes: cross-product (baits x candidates) or pair-list
- * (only the pairs named in params.pairs_tsv). Both emit the same TSV, so
- * every downstream stage is mode-agnostic; see bin/generate_pairs.py and
- * README.pair_input.md. Pairs are collapsed on tuple(sorted((a,b))) since
- * A_with_B and B_with_A are the same complex: a no-op when the bait and
- * candidate sets are disjoint, and a halving when they overlap.
+ * GENERATE_PAIRS resolves the run's two inputs, one pool
+ * (params.sequences_fasta) and one pair table (params.pairs_tsv), into the
+ * pairs.tsv that drives every downstream stage.
+ *
+ * This process is the resolver between a permissive input schema (first two
+ * columns are IDs, positional, header auto-detected: so a raw proteomics
+ * export drops in unmodified) and a strict emitted one (pair_id, bait_id,
+ * bait_seq, candidate_id, candidate_seq). Those two schemas are deliberately
+ * NOT the same thing: the input is an edge list, the emitted file is the
+ * materialized screen with sequences inlined.
+ *
+ * CHAIN ORDER: column 1 is the bait is chain A, guaranteed from here on.
+ * Pairs are collapsed on tuple(sorted((a,b))) since A_with_B and B_with_A are
+ * the same complex, and the FIRST orientation listed is the one kept: so
+ * the collapse discards a later restatement rather than re-orienting the row
+ * that survives.
+ *
+ * pairs.tsv is also where the MSA universe comes from (main.nf derives the
+ * unique-protein channel from this file's rows, not from any FASTA).
  *
  * MAKE_BOLTZ_YAML / MAKE_BOLTZ_YAML_NO_MSA then assemble one Boltz-2 input
  * YAML per pair, with or without pre-computed MSA CSVs. (The AF3 equivalent,
  * MAKE_AF3_JSON, lives in predict_af3.nf.)
  *
- * PTMs come from a single id-keyed table (params.ptms, conventionally
- * ptms.tsv; tab or comma). make_boltz_yaml.py resolves each chain's
- * modifications by protein ID, never by whether that protein is the bait or
- * the candidate of this particular pair.
+ * PTMs come from ONE id-keyed table (params.ptms, conventionally ptms.tsv;
+ * tab or comma). make_boltz_yaml.py resolves each chain's modifications by
+ * protein ID, never by whether that protein is the bait or the candidate of
+ * this particular pair. See resolvePtms() in main.nf.
  */
 
 process GENERATE_PAIRS {
@@ -25,63 +37,40 @@ process GENERATE_PAIRS {
     publishDir "${params.outdir}/pairs", mode: 'copy'
 
     input:
-    path baits_fasta, stageAs: 'pairgen_input_a'
-    path candidates_fasta, stageAs: 'pairgen_input_b'
+    path pairs_tsv,       stageAs: 'pairgen_pairs.tsv'
+    path sequences_fasta, stageAs: 'pairgen_sequences.fasta'
 
     output:
     path "pairs.tsv", emit: pairs_tsv
 
     script:
-    // Two input modes, same output contract (see bin/generate_pairs.py).
-    // Cross-product: baits x candidates, the classic pulldown design.
-    // Pair-list: only the pairs named in params.pairs_tsv, for adding
-    // structure-based ranking to an experimental edge list. main.nf decides
-    // which files are staged here; this process only picks the matching
-    // command line. --self-pairs applies to the cross product only: an
-    // explicitly listed self-pair is always kept, since the list is the
-    // user's stated intent.
-    def self_flag = params.self_pairs ? "--self-pairs" : ""
-    if (params.pairs_tsv)
-        """
-        generate_pairs.py \
-            --pairs-tsv ${baits_fasta} \
-            --sequences ${candidates_fasta} \
-            --output pairs.tsv
-        """
-    else
-        """
-        generate_pairs.py \
-            --baits ${baits_fasta} \
-            --candidates ${candidates_fasta} \
-            --output pairs.tsv \
-            ${self_flag}
-        """
+    """
+    generate_pairs.py \
+        --pairs-tsv ${pairs_tsv} \
+        --sequences ${sequences_fasta} \
+        --output pairs.tsv
+    """
 
     stub:
     // Pure-Python, local files only: safe and fast to run for real; also
     // gives downstream stub processes a genuine pairs.tsv to fan out over.
-    def self_flag = params.self_pairs ? "--self-pairs" : ""
-    if (params.pairs_tsv)
-        """
-        generate_pairs.py \
-            --pairs-tsv ${baits_fasta} \
-            --sequences ${candidates_fasta} \
-            --output pairs.tsv
-        """
-    else
-        """
-        generate_pairs.py \
-            --baits ${baits_fasta} \
-            --candidates ${candidates_fasta} \
-            --output pairs.tsv \
-            ${self_flag}
-        """
+    """
+    generate_pairs.py \
+        --pairs-tsv ${pairs_tsv} \
+        --sequences ${sequences_fasta} \
+        --output pairs.tsv
+    """
 }
 
 
 process MAKE_BOLTZ_YAML {
     tag "${pair_id}"
     label 'process_low'
+
+    // Content-addressed caching: the Boltz-2 half of the same fix applied
+    // to MAKE_AF3_JSON.
+    //
+    cache 'deep'
 
     publishDir "${params.outdir}/yamls", mode: 'copy'
 

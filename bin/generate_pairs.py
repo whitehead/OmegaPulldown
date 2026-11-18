@@ -2,44 +2,52 @@
 """
 Generate the pair list that drives the rest of the pipeline.
 
-Two input modes, producing an identical output TSV so nothing downstream
-changes:
+A single input shape to accommodate different screen designs:
 
-  1. CROSS-PRODUCT (--baits/--candidates): every bait x candidate pair.
-     The classic pulldown design -- one or a few baits against a candidate
-     list, e.g. the hits from one AP-MS experiment.
+    generate_pairs.py --pairs-tsv pairs.tsv --sequences pool.fasta \
+                      --output pairs.tsv
 
-  2. PAIR LIST (--pairs-tsv/--sequences): only the pairs named in a TSV.
-     For adding structure-based ranking to an existing edge list, e.g.
-     interacting pairs reported by proteomics.
+  --pairs-tsv   the pair set: an edge list whose first two columns are
+                protein IDs
+  --sequences   the protein pool: a FASTA holding every protein that list
+                names
 
-The protein ID is the first whitespace-delimited token of the FASTA header.
+INPUT SCHEMA
+---------------------------------------
+First two columns are protein IDs, positional; a header row is detected
+rather than required; further columns (MS score, FDR, spectral counts) are
+ignored. Allows a raw proteomics export drop in unmodified: SAINT output
+with Bait/Prey/SaintScore, or whatever a given IP-MS pipeline calls its
+columns.
 
-Output TSV columns:
+OUTPUT SCHEMA
+----------------------
   pair_id, bait_id, bait_seq, candidate_id, candidate_seq
 
-Pair IDs use the format: {bait}_with_{candidate}  (e.g. actin_with_HuR)
+Pair IDs use the format {bait}_with_{candidate}  (e.g. actin_with_HuR).
+
+CHAIN-ORDER CONTRACT
+--------------------
+Column 1 is the bait is chain A. The input's first column becomes bait_id
+becomes chain A in the predicted complex, through every downstream stage.
+The chains are physically distinguishable in the output, so something has to
+pick A deterministically: this is that rule.
+
+An AP-MS user who puts their tagged bait in column 1 therefore gets it as
+chain A, which is almost always the intent.
 
 UNORDERED PAIRS
 ---------------
-A complex is unordered: A_with_B and B_with_A are the same system, and
-predicting both wastes half the GPU budget. Both modes therefore collapse
-pairs on the canonical key tuple(sorted((a, b))) and keep the first
-orientation seen. This is a no-op when baits and candidates are disjoint
-(the usual pulldown case) and halves the work exactly when they overlap --
-e.g. an all-vs-all run with --baits and --candidates set to the same file,
-which previously emitted N^2 - N ordered pairs instead of N(N-1)/2.
-
-Which protein ends up as the "bait" of a collapsed pair is determined by
-iteration order (sorted, so deterministic and reproducible). That choice is
-purely cosmetic: it fixes chain order (bait is chain A) and the pair_id,
-nothing else.
+A complex is unordered: A_with_B and B_with_A are the same system.
+Pairs are collapsed on the canonical key tuple(sorted((a, b))) and the
+FIRST orientation listed wins, so the collapse never overrides the
+chain-order contract for the row that survives, it only discards the later
+restatement.
 """
 
 import argparse
 import csv
 import sys
-from itertools import product
 
 
 def parse_fasta(fasta_path):
@@ -114,88 +122,58 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--baits", help="FASTA of bait sequences (cross-product mode)")
-    parser.add_argument("--candidates", help="FASTA of candidate sequences (cross-product mode)")
-    parser.add_argument("--pairs-tsv", dest="pairs_tsv",
-                        help="TSV/CSV whose first two columns name the pairs to predict (pair-list mode)")
-    parser.add_argument("--sequences",
+    parser.add_argument("--pairs-tsv", dest="pairs_tsv", required=True,
+                        help="TSV/CSV whose first two columns name the pairs "
+                             "to predict. Column 1 becomes chain A.")
+    parser.add_argument("--sequences", required=True,
                         help="FASTA holding every protein referenced by --pairs-tsv")
     parser.add_argument("--output", default="pairs.tsv", help="Output TSV file")
-    parser.add_argument("--self-pairs", action="store_true",
-                        help="Cross-product mode only: include homodimers (A with A). "
-                             "In pair-list mode an explicitly listed self-pair is always "
-                             "kept, since the list states the user's intent.")
     args = parser.parse_args()
 
-    pair_mode = bool(args.pairs_tsv)
-    if pair_mode:
-        if not args.sequences:
-            sys.exit("ERROR: --pairs-tsv requires --sequences (a FASTA with every protein it names)")
-        if args.baits or args.candidates:
-            sys.exit("ERROR: --pairs-tsv is mutually exclusive with --baits/--candidates")
-    else:
-        if not (args.baits and args.candidates):
-            sys.exit("ERROR: need either --baits and --candidates, or --pairs-tsv and --sequences")
+    seqs = load_sequences_from_fasta(args.sequences)
+    if not seqs:
+        sys.exit(f"ERROR: no FASTA sequences found in {args.sequences}")
+    rows = read_pair_list(args.pairs_tsv, seqs)
+    print(f"Loaded {len(seqs)} sequences and {len(rows)} listed pairs",
+          file=sys.stderr)
+
+    # Resolve every ID before writing anything. A pair list naming a protein
+    # the pool does not hold is a specification error.
+    missing = {}
+    for a, b, lineno in rows:
+        for pid in (a, b):
+            if pid not in seqs:
+                missing.setdefault(pid, lineno)
+    if missing:
+        shown = list(missing.items())[:10]
+        detail = "\n".join(f"    {pid}  (first seen line {ln})"
+                           for pid, ln in shown)
+        more = "" if len(missing) <= 10 else f"\n    ... and {len(missing) - 10} more"
+        sys.exit(f"ERROR: {len(missing)} protein ID(s) in {args.pairs_tsv} "
+                 f"are absent from {args.sequences}:\n{detail}{more}")
 
     seen = set()
     dupes = 0
     n = 0
-
     with open(args.output, "w") as out:
         out.write("pair_id\tbait_id\tbait_seq\tcandidate_id\tcandidate_seq\n")
+        for a, b, _ in rows:
+            key = tuple(sorted((a, b)))
+            if key in seen:
+                dupes += 1
+                continue
+            seen.add(key)
+            out.write(f"{a}_with_{b}\t{a}\t{seqs[a]}\t{b}\t{seqs[b]}\n")
+            n += 1
 
-        if pair_mode:
-            seqs = load_sequences_from_fasta(args.sequences)
-            if not seqs:
-                sys.exit(f"ERROR: no FASTA sequences found in {args.sequences}")
-            rows = read_pair_list(args.pairs_tsv, seqs)
-            print(f"Loaded {len(seqs)} sequences and {len(rows)} listed pairs",
-                  file=sys.stderr)
-
-            missing = {}
-            for a, b, lineno in rows:
-                for pid in (a, b):
-                    if pid not in seqs:
-                        missing.setdefault(pid, lineno)
-            if missing:
-                shown = list(missing.items())[:10]
-                detail = "\n".join(f"    {pid}  (first seen line {ln})"
-                                   for pid, ln in shown)
-                more = "" if len(missing) <= 10 else f"\n    ... and {len(missing) - 10} more"
-                sys.exit(f"ERROR: {len(missing)} protein ID(s) in {args.pairs_tsv} "
-                         f"are absent from {args.sequences}:\n{detail}{more}")
-
-            for a, b, _ in rows:
-                key = tuple(sorted((a, b)))
-                if key in seen:
-                    dupes += 1
-                    continue
-                seen.add(key)
-                out.write(f"{a}_with_{b}\t{a}\t{seqs[a]}\t{b}\t{seqs[b]}\n")
-                n += 1
-        else:
-            baits = load_sequences_from_fasta(args.baits)
-            candidates = load_sequences_from_fasta(args.candidates)
-            if not baits:
-                sys.exit(f"ERROR: no FASTA sequences found in {args.baits}")
-            if not candidates:
-                sys.exit(f"ERROR: no FASTA sequences found in {args.candidates}")
-            print(f"Loaded {len(baits)} baits and {len(candidates)} candidates",
-                  file=sys.stderr)
-
-            for bait_id, cand_id in product(sorted(baits.keys()),
-                                            sorted(candidates.keys())):
-                if not args.self_pairs and bait_id == cand_id:
-                    continue
-                key = tuple(sorted((bait_id, cand_id)))
-                if key in seen:
-                    dupes += 1
-                    continue
-                seen.add(key)
-                out.write(f"{bait_id}_with_{cand_id}\t{bait_id}\t{baits[bait_id]}"
-                          f"\t{cand_id}\t{candidates[cand_id]}\n")
-                n += 1
-
+    # Proteins in the pool that no surviving pair names get no MSA, because
+    # the MSA universe is read from this file (main.nf) rather than from the
+    # pool.
+    used = {pid for pair in seen for pid in pair}
+    unused = len(seqs) - len(used)
+    if unused:
+        print(f"{unused} of {len(seqs)} pooled protein(s) are named by no pair; "
+              f"they get no MSA and no prediction", file=sys.stderr)
     if dupes:
         print(f"Collapsed {dupes} duplicate unordered pair(s) "
               f"(A_with_B == B_with_A)", file=sys.stderr)

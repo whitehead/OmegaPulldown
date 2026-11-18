@@ -12,7 +12,7 @@
 process MAKE_AF3_JSON {
     tag "${pair_id}"
     label 'process_low'
-
+    cache 'deep'
     publishDir "${params.outdir}/jsons", mode: 'copy'
 
     input:
@@ -125,7 +125,7 @@ process AF3_PREDICT {
 
     stub:
     // No singularity/GPU invocation: this needs real model weights and a
-    // GPU, neither is appropriate for a stub-run on the head node. Minimal
+    // GPU, neither appropriate for a stub-run on the head node. Minimal
     // placeholder output matching what PARSE_METRICS_AF3 (rank_af3.nf)
     // globs for: *_sample-*_summary_confidences.json, *_sample-*_model.cif.
     """

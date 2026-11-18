@@ -1,0 +1,11 @@
+bait_id	candidate_id
+HuR	KcsA
+HuR	MB
+HuR	PFN1
+HuR	actin
+KcsA	MB
+KcsA	PFN1
+KcsA	actin
+MB	PFN1
+MB	actin
+PFN1	actin

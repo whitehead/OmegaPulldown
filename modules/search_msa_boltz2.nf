@@ -13,10 +13,8 @@
  *   3. MERGE_TAXONOMY_BOLTZ2 -- merges UniRef30 + env a3ms (or passes
  *      UniRef30 through untouched when env didn't run) and does the
  *      taxonomy-ID tagging + CSV write (process_medium, 128GB).
- */
-
-/*
- * UniRef30 search only: the real `mmseqs_search_monomer` recipe.
+ *
+ * UniRef30 search only: the real `mmseqs_search_monomer` recipe
  *
  * Batched across proteins, same rationale and mechanism as AF3-native's
  * MSA_SEARCH_DB (see search_msa_af3.nf): the expensive part is loading the
@@ -55,11 +53,11 @@ EOF
 
     mmseqs createdb query.fasta qdb
 
-    # Faithful reproduction of colabfold's mmseqs_search_monomer()
+    # Faithful reproduction of colabfold's own mmseqs_search_monomer()
     # (filter=True branch, UniRef30 half).
     #
     # --db-load-mode 3 ("mmap+touch") on every subcommand, not colabfold's
-    # own default of 2 ("mmap"): mode 2's lazy  mmap can stall for a very
+    # own default of 2 ("mmap"): mode 2's lazy mmap can stall for a very
     # long time, independent of available memory.
     mmseqs search qdb ${db} res tmp \
         --threads ${task.cpus} \
@@ -87,7 +85,7 @@ EOF
         --qid 0.0,0.2,0.4,0.6,0.8,1.0 --qsc 0 --max-seq-id 0.95
 
     # "res*" matches only the search/expandaln/align/filterresult
-    # intermediates (res, res_exp, res_exp_realign, res_exp_realign_filter),
+    # intermediates (res, res_exp, res_exp_realign, res_exp_realign_filter).
     # NOT "prof_res*" (doesn't start with "res") or "qdb*"/"uniref.a3m*",
     # which are declared outputs and must survive this task.
     rm -rf tmp res*
@@ -116,7 +114,7 @@ EOF
  * Query is prof_res (the profile from MSA_SEARCH_DB_BOLTZ2's UniRef
  * iterative search), not a fresh qdb query: the whole point of running
  * this second, profile-seeded search rather than independently from
- * scratch, the same as colabfold's recipe.
+ * scratch, same as colabfold's own recipe.
  *
  * Label: process_mmseqs_bigmem (800GB).
  */
@@ -193,7 +191,7 @@ process MERGE_TAXONOMY_BOLTZ2 {
     tag "batch_of_${batch.size()}"
     label 'process_medium'
 
-    publishDir "${params.outdir}/alignments_boltz2/csv", mode: 'copy'
+    publishDir "${params.alignments_dir_boltz2}/csv", mode: 'copy'
 
     input:
     tuple val(batch), path(qdb_files), path(uniref_a3m_files), path(env_a3m_files)
@@ -237,7 +235,7 @@ process MERGE_TAXONOMY_BOLTZ2 {
     redis-server --dir \$(pwd) --dbfilename \$(basename ${params.taxonomy_rdb}) --port 7777 &
     REDIS_PID=\$!
     # Capture the real exit status before cleanup and re-exit with it
-    # explicitly, and keep `kill ... || true`: both fixes are essential,
+    # explicitly, and keep `kill ... || true`: both fixes are essential.
     trap 'ec=\$?; redis-cli -p 7777 shutdown nosave >/dev/null 2>&1; kill \$REDIS_PID 2>/dev/null || true; exit \$ec' EXIT
     for i in \$(seq 1 120); do
         redis-cli -p 7777 ping 2>/dev/null | grep -q PONG && break
